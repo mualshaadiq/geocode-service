@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     mongodb_db: str = "geocode_service"
     collection_name: str = "toponyms"
 
-    model_config = {"env_file": ".env"}
+    model_config = {"env_file": ".env", "extra": "ignore"}
 
 
 settings = Settings()
