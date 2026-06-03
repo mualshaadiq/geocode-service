@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
 """
-One-time import of all Indonesian administrative toponyms from the Aetos geocode
-service into a local MongoDB collection. Safe to re-run (upserts on GID codes).
+Import Indonesian administrative toponyms from GADM v4.1 open data into MongoDB.
+GADM uses the same GID code format (IDN.7_1, IDN.7.5_1, IDN.7.5.3_1) as the
+Aetos geocode system, so downstream GeometryRef resolution works unchanged.
+
+Safe to re-run (upserts). Downloads ~8 MB of GeoJSON from gadm.org.
 
 Usage:
-    GEOCODE_BASE_URL=https://app.dev.aetosky.com/api/services/geocode \
-    GEOCODE_AUTH_TOKEN=<token> \
     MONGODB_URL=mongodb://localhost:27017 \
+    MONGODB_DB=geocode_service \
     python scripts/import_toponyms.py
-
-Environment variables:
-    GEOCODE_BASE_URL    Base URL for the Aetos geocode API  (required)
-    GEOCODE_AUTH_TOKEN  Bearer token for the geocode API    (required)
-    MONGODB_URL         MongoDB connection string           (default: mongodb://localhost:27017)
-    MONGODB_DB          Database name                       (default: geocode_service)
-    IMPORT_CONCURRENCY  Concurrent HTTP requests            (default: 10)
 """
 import asyncio
+import io
+import json
 import logging
 import os
 import sys
+import zipfile
 
 import httpx
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -31,25 +29,26 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-GEOCODE_BASE_URL = os.environ.get(
-    "GEOCODE_BASE_URL", "https://app.dev.aetosky.com/api/services/geocode"
-).rstrip("/")
-GEOCODE_AUTH_TOKEN = os.environ.get("GEOCODE_AUTH_TOKEN", "")
 MONGODB_URL = os.environ.get("MONGODB_URL", "mongodb://localhost:27017")
 MONGODB_DB = os.environ.get("MONGODB_DB", "geocode_service")
-CONCURRENCY = int(os.environ.get("IMPORT_CONCURRENCY", "10"))
+
+GADM_BASE = "https://geodata.ucdavis.edu/gadm/gadm4.1/json"
+GADM_FILES = {
+    1: f"{GADM_BASE}/gadm41_IDN_1.json.zip",
+    2: f"{GADM_BASE}/gadm41_IDN_2.json.zip",
+    3: f"{GADM_BASE}/gadm41_IDN_3.json.zip",
+}
+
+LEVEL_MAP = {1: "province", 2: "district", 3: "subdistrict"}
 
 
-async def fetch(client: httpx.AsyncClient, path: str, params: dict | None = None) -> list:
-    headers = {}
-    if GEOCODE_AUTH_TOKEN:
-        headers["Authorization"] = f"Bearer {GEOCODE_AUTH_TOKEN}"
-    resp = await client.get(
-        f"{GEOCODE_BASE_URL}{path}", params=params, headers=headers, timeout=30
-    )
+async def download_geojson(client: httpx.AsyncClient, url: str) -> dict:
+    log.info(f"Downloading {url} …")
+    resp = await client.get(url, timeout=120, follow_redirects=True)
     resp.raise_for_status()
-    data = resp.json()
-    return data if isinstance(data, list) else []
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+        name = next(n for n in z.namelist() if n.endswith(".json"))
+        return json.loads(z.read(name))
 
 
 async def import_all() -> None:
@@ -64,129 +63,101 @@ async def import_all() -> None:
             name="search_text_index",
             default_language="none",
         )
-    await col.create_index("gid_1", sparse=True, background=True)
-    await col.create_index("gid_2", sparse=True, background=True)
-    await col.create_index("gid_3", sparse=True, background=True)
+    for field in ("gid_1", "gid_2", "gid_3"):
+        await col.create_index(field, sparse=True, background=True)
 
-    sem = asyncio.Semaphore(CONCURRENCY)
     total = 0
+    # Build province name lookup for constructing search_text at lower levels
+    prov_names: dict[str, str] = {}
+    dist_names: dict[str, str] = {}
 
     async with httpx.AsyncClient(verify=False) as client:
-        # ── Countries ──────────────────────────────────────────────
-        countries = await fetch(client, "/countries")
-        idn = next((c for c in countries if c.get("gid_0") == "IDN"), None)
-        if not idn:
-            log.error("Indonesia (IDN) not found in the geocode service. Aborting.")
-            return
-        log.info("Found Indonesia (IDN)")
+        for adm_level in (1, 2, 3):
+            geojson = await download_geojson(client, GADM_FILES[adm_level])
+            features = geojson.get("features", [])
+            log.info(f"ADM{adm_level}: {len(features)} features")
 
-        # ── Provinces ──────────────────────────────────────────────
-        provinces = await fetch(client, "/adm_1", {"gid_0": "IDN"})
-        log.info(f"Fetched {len(provinces)} provinces")
+            count = 0
+            for feat in features:
+                p = feat.get("properties", {})
+                level = LEVEL_MAP[adm_level]
 
-        for p in provinces:
-            doc = {
-                "name": p["name_1"],
-                "full_path": f"{p['name_1']}, Indonesia",
-                "search_text": f"{p['name_1'].lower()} indonesia",
-                "level": "province",
-                "gid_0": "IDN",
-                "gid_1": p["gid_1"],
-                "gid_2": None,
-                "gid_3": None,
-                "parent_names": ["Indonesia"],
-            }
-            await col.update_one(
-                {"gid_1": doc["gid_1"], "level": "province"},
-                {"$set": doc},
-                upsert=True,
-            )
-        total += len(provinces)
-        log.info(f"Upserted {len(provinces)} provinces")
+                if adm_level == 1:
+                    gid_1 = p.get("GID_1", "")
+                    name = p.get("NAME_1", "")
+                    prov_names[gid_1] = name
+                    doc = {
+                        "name": name,
+                        "full_path": f"{name}, Indonesia",
+                        "search_text": f"{name.lower()} indonesia",
+                        "level": level,
+                        "gid_0": "IDN",
+                        "gid_1": gid_1,
+                        "gid_2": None,
+                        "gid_3": None,
+                        "parent_names": ["Indonesia"],
+                    }
+                    await col.update_one(
+                        {"gid_1": gid_1, "level": "province"},
+                        {"$set": doc},
+                        upsert=True,
+                    )
 
-        # ── Districts (concurrent per province) ───────────────────
-        async def fetch_districts(prov: dict) -> tuple[dict, list]:
-            async with sem:
-                districts = await fetch(
-                    client, "/adm_2", {"gid_0": "IDN", "gid_1": prov["gid_1"]}
-                )
-                return prov, districts
+                elif adm_level == 2:
+                    gid_1 = p.get("GID_1", "")
+                    gid_2 = p.get("GID_2", "")
+                    name = p.get("NAME_2", "")
+                    pname = prov_names.get(gid_1, "")
+                    dist_names[gid_2] = name
+                    doc = {
+                        "name": name,
+                        "full_path": f"{name}, {pname}, Indonesia",
+                        "search_text": f"{name.lower()} {pname.lower()} indonesia",
+                        "level": level,
+                        "gid_0": "IDN",
+                        "gid_1": gid_1,
+                        "gid_2": gid_2,
+                        "gid_3": None,
+                        "parent_names": [pname, "Indonesia"],
+                    }
+                    await col.update_one(
+                        {"gid_2": gid_2, "level": "district"},
+                        {"$set": doc},
+                        upsert=True,
+                    )
 
-        prov_results = await asyncio.gather(*[fetch_districts(p) for p in provinces])
+                elif adm_level == 3:
+                    gid_1 = p.get("GID_1", "")
+                    gid_2 = p.get("GID_2", "")
+                    gid_3 = p.get("GID_3", "")
+                    name = p.get("NAME_3", "")
+                    pname = prov_names.get(gid_1, "")
+                    dname = dist_names.get(gid_2, "")
+                    doc = {
+                        "name": name,
+                        "full_path": f"{name}, {dname}, {pname}, Indonesia",
+                        "search_text": f"{name.lower()} {dname.lower()} {pname.lower()} indonesia",
+                        "level": level,
+                        "gid_0": "IDN",
+                        "gid_1": gid_1,
+                        "gid_2": gid_2,
+                        "gid_3": gid_3,
+                        "parent_names": [dname, pname, "Indonesia"],
+                    }
+                    await col.update_one(
+                        {"gid_3": gid_3},
+                        {"$set": doc},
+                        upsert=True,
+                    )
 
-        all_districts: list[tuple[dict, dict]] = []
-        district_count = 0
-        for prov, districts in prov_results:
-            for d in districts:
-                doc = {
-                    "name": d["name_2"],
-                    "full_path": f"{d['name_2']}, {prov['name_1']}, Indonesia",
-                    "search_text": f"{d['name_2'].lower()} {prov['name_1'].lower()} indonesia",
-                    "level": "district",
-                    "gid_0": "IDN",
-                    "gid_1": prov["gid_1"],
-                    "gid_2": d["gid_2"],
-                    "gid_3": None,
-                    "parent_names": [prov["name_1"], "Indonesia"],
-                }
-                await col.update_one(
-                    {"gid_2": doc["gid_2"], "level": "district"},
-                    {"$set": doc},
-                    upsert=True,
-                )
-                all_districts.append((prov, d))
-                district_count += 1
+                count += 1
 
-        total += district_count
-        log.info(f"Upserted {district_count} districts")
-
-        # ── Subdistricts (concurrent per district) ─────────────────
-        log.info(f"Fetching subdistricts for {len(all_districts)} districts (this may take a few minutes)…")
-
-        async def fetch_subdistricts(prov: dict, dist: dict) -> tuple[dict, dict, list]:
-            async with sem:
-                subs = await fetch(
-                    client,
-                    "/adm_3",
-                    {"gid_0": "IDN", "gid_1": prov["gid_1"], "gid_2": dist["gid_2"]},
-                )
-                return prov, dist, subs
-
-        sub_results = await asyncio.gather(
-            *[fetch_subdistricts(prov, dist) for prov, dist in all_districts]
-        )
-
-        sub_count = 0
-        for prov, dist, subs in sub_results:
-            for s in subs:
-                if "gid_3" not in s or "name_3" not in s:
-                    continue
-                doc = {
-                    "name": s["name_3"],
-                    "full_path": f"{s['name_3']}, {dist['name_2']}, {prov['name_1']}, Indonesia",
-                    "search_text": f"{s['name_3'].lower()} {dist['name_2'].lower()} {prov['name_1'].lower()} indonesia",
-                    "level": "subdistrict",
-                    "gid_0": "IDN",
-                    "gid_1": prov["gid_1"],
-                    "gid_2": dist["gid_2"],
-                    "gid_3": s["gid_3"],
-                    "parent_names": [dist["name_2"], prov["name_1"], "Indonesia"],
-                }
-                await col.update_one(
-                    {"gid_3": doc["gid_3"]},
-                    {"$set": doc},
-                    upsert=True,
-                )
-                sub_count += 1
-
-        total += sub_count
-        log.info(f"Upserted {sub_count} subdistricts")
+            total += count
+            log.info(f"ADM{adm_level}: upserted {count} documents")
 
     mongo.close()
     log.info(f"Import complete — {total} total documents in '{MONGODB_DB}.toponyms'")
 
 
 if __name__ == "__main__":
-    if not GEOCODE_AUTH_TOKEN:
-        log.warning("GEOCODE_AUTH_TOKEN is not set — requests may be rejected by the API")
     asyncio.run(import_all())
