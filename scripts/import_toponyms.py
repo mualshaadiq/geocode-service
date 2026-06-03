@@ -71,7 +71,7 @@ async def import_all() -> None:
     sem = asyncio.Semaphore(CONCURRENCY)
     total = 0
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(verify=False) as client:
         # ── Countries ──────────────────────────────────────────────
         countries = await fetch(client, "/countries")
         idn = next((c for c in countries if c.get("gid_0") == "IDN"), None)
