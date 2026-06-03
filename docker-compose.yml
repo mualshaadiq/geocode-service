@@ -1,0 +1,33 @@
+services:
+  geocode-service:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      MONGODB_URL: mongodb://mongodb:27017
+      MONGODB_DB: geocode_service
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - geocode-net
+
+  mongodb:
+    image: mongo:7.0
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - geocode-net
+
+volumes:
+  mongodb_data:
+
+networks:
+  geocode-net:
+    driver: bridge
