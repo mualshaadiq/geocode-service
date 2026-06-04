@@ -82,6 +82,8 @@ async def import_all() -> None:
                 p = feat.get("properties", {})
                 level = LEVEL_MAP[adm_level]
 
+                geometry = feat.get("geometry")
+
                 if adm_level == 1:
                     gid_1 = p.get("GID_1", "")
                     name = p.get("NAME_1", "")
@@ -96,6 +98,7 @@ async def import_all() -> None:
                         "gid_2": None,
                         "gid_3": None,
                         "parent_names": ["Indonesia"],
+                        "geometry": geometry,
                     }
                     await col.update_one(
                         {"gid_1": gid_1, "level": "province"},
@@ -119,6 +122,7 @@ async def import_all() -> None:
                         "gid_2": gid_2,
                         "gid_3": None,
                         "parent_names": [pname, "Indonesia"],
+                        "geometry": geometry,
                     }
                     await col.update_one(
                         {"gid_2": gid_2, "level": "district"},
@@ -143,6 +147,7 @@ async def import_all() -> None:
                         "gid_2": gid_2,
                         "gid_3": gid_3,
                         "parent_names": [dname, pname, "Indonesia"],
+                        "geometry": geometry,
                     }
                     await col.update_one(
                         {"gid_3": gid_3},

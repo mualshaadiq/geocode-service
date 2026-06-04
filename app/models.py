@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Any, Optional
 
 
 class ToponymResult(BaseModel):
@@ -16,3 +16,10 @@ class SearchResponse(BaseModel):
     results: list[ToponymResult]
     count: int
     query: str
+
+
+class GeometryResult(BaseModel):
+    code: str
+    name: str
+    level: str
+    geometry: Optional[Any] = None  # GeoJSON geometry object
