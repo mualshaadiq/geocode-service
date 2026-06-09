@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GEO-1 · Cascading Hierarchy Test</title>
+<style>
+  :root { --bg:#0f1419; --card:#1a212b; --line:#2c3744; --fg:#e6edf3; --muted:#8b98a5; --accent:#4493f8; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+         background:var(--bg); color:var(--fg); display:flex; justify-content:center; padding:40px 16px; }
+  .wrap { width:100%; max-width:640px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:24px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; margin-bottom:16px; }
+  label { display:block; font-size:13px; color:var(--muted); margin-bottom:6px; }
+  select { width:100%; padding:10px 12px; font-size:15px; border-radius:8px; border:1px solid var(--line);
+           background:#0d1117; color:var(--fg); margin-bottom:16px; appearance:none; cursor:pointer; }
+  select:disabled { opacity:.45; cursor:not-allowed; }
+  select:last-of-type { margin-bottom:0; }
+  .row { display:flex; align-items:center; gap:8px; font-size:12px; color:var(--muted); margin-bottom:6px; }
+  .count { color:var(--accent); }
+  pre { background:#0d1117; border:1px solid var(--line); border-radius:8px; padding:14px; overflow:auto;
+        font-size:12.5px; line-height:1.5; margin:0; color:#c9d1d9; max-height:340px; }
+  .pill { display:inline-block; background:#0d1117; border:1px solid var(--line); border-radius:999px;
+          padding:2px 10px; font-size:12px; color:var(--accent); font-family:ui-monospace,monospace; }
+  .err { color:#f85149; }
+  .muted { color:var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Cascading Hierarchy — GEO-1</h1>
+  <div class="sub">Provinsi → Kabupaten/Kota → Kecamatan, lalu resolve geometry. Tiap dropdown manggil API list yang ter-scope ke parent.</div>
+
+  <div class="card">
+    <div class="row"><span>Provinsi</span><span class="count" id="c-prov"></span></div>
+    <label for="prov" class="muted">GET /provinces</label>
+    <select id="prov"><option value="">Memuat…</option></select>
+
+    <div class="row"><span>Kabupaten / Kota</span><span class="count" id="c-dist"></span></div>
+    <label for="dist" class="muted">GET /provinces/{gid_1}/districts</label>
+    <select id="dist" disabled><option value="">— pilih provinsi dulu —</option></select>
+
+    <div class="row"><span>Kecamatan</span><span class="count" id="c-sub"></span></div>
+    <label for="sub" class="muted">GET /districts/{gid_2}/subdistricts</label>
+    <select id="sub" disabled><option value="">— pilih kab/kota dulu —</option></select>
+  </div>
+
+  <div class="card">
+    <div class="row"><span>Hasil pilihan</span><span class="pill" id="sel-code">—</span></div>
+    <pre id="out" class="muted">Pilih minimal satu level — geometry di-resolve untuk level terdalam yang dipilih (provinsi / kabupaten / kecamatan) lewat GET /geometry/{level}/{code}.</pre>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const prov = $('prov'), dist = $('dist'), sub = $('sub');
+
+async function api(path) {
+  const r = await fetch(path);
+  if (!r.ok) throw new Error(`${path} → HTTP ${r.status}`);
+  return r.json();
+}
+
+function fill(sel, items, placeholder) {
+  sel.innerHTML = `<option value="">${placeholder}</option>` +
+    items.map(it => `<option value="${it.code}" data-name="${it.name}" data-path="${it.full_path}">${it.name}</option>`).join('');
+  sel.disabled = false;
+}
+
+function reset(sel, msg) {
+  sel.innerHTML = `<option value="">${msg}</option>`;
+  sel.disabled = true;
+}
+
+function showError(e) {
+  $('out').className = 'err';
+  $('out').textContent = '⚠ ' + e.message;
+}
+
+// 1. Load provinces on start
+(async () => {
+  try {
+    const d = await api('/provinces');
+    fill(prov, d.items, '— pilih provinsi —');
+    $('c-prov').textContent = `${d.count} provinsi`;
+  } catch (e) { prov.innerHTML = '<option>gagal memuat</option>'; showError(e); }
+})();
+
+// Resolve geometry for whatever level is currently the deepest selection.
+// The /geometry endpoint accepts province / district / subdistrict, so the
+// cascade does NOT need to reach kecamatan — you can stop at any level.
+async function resolve(level, sel) {
+  const opt = sel.options[sel.selectedIndex];
+  const code = sel.value;
+  $('sel-code').textContent = code;
+  $('out').className = 'muted'; $('out').textContent = `Resolving geometry ${level}…`;
+  try {
+    const g = await api(`/geometry/${level}/${encodeURIComponent(code)}`);
+    const geom = g.geometry || {};
+    $('out').className = '';
+    $('out').textContent = JSON.stringify({
+      full_path: opt.dataset.path,
+      resolved_via: `GET /geometry/${level}/${code}`,
+      name: g.name, level: g.level, code: g.code,
+      geometry_type: geom.type,
+      geometry_size_chars: JSON.stringify(geom.coordinates || []).length
+    }, null, 2);
+  } catch (e) { showError(e); }
+}
+
+// 2. Province → load districts + resolve province geometry (valid even if you stop here)
+prov.addEventListener('change', async () => {
+  reset(dist, '— pilih kab/kota dulu —'); reset(sub, '— pilih kab/kota dulu —');
+  $('c-dist').textContent = ''; $('c-sub').textContent = '';
+  if (!prov.value) {
+    $('sel-code').textContent = '—';
+    $('out').className = 'muted'; $('out').textContent = 'Pilih minimal satu level untuk resolve geometry.';
+    return;
+  }
+  resolve('province', prov);
+  try {
+    const d = await api(`/provinces/${encodeURIComponent(prov.value)}/districts`);
+    fill(dist, d.items, '— pilih kab/kota —');
+    $('c-dist').textContent = `${d.count} kab/kota`;
+  } catch (e) { showError(e); }
+});
+
+// 3. District → load subdistricts + resolve district geometry (valid even if you stop here)
+dist.addEventListener('change', async () => {
+  reset(sub, '— pilih kecamatan —'); $('c-sub').textContent = '';
+  if (!dist.value) { resolve('province', prov); return; }  // backed up to province
+  resolve('district', dist);
+  try {
+    const d = await api(`/districts/${encodeURIComponent(dist.value)}/subdistricts`);
+    fill(sub, d.items, '— pilih kecamatan —');
+    $('c-sub').textContent = `${d.count} kecamatan`;
+  } catch (e) { showError(e); }
+});
+
+// 4. Subdistrict → resolve subdistrict geometry (or back to district if cleared)
+sub.addEventListener('change', () => {
+  if (!sub.value) { resolve('district', dist); return; }
+  resolve('subdistrict', sub);
+});
+</script>
+</body>
+</html>
